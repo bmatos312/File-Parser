@@ -3,88 +3,105 @@ import re
 import logging
 import threading
 import csv
+import sys
 import tkinter as tk
-from tkinter import Tk, Label, Entry, Button, Text, filedialog, StringVar, Frame, END, W, E, S, N, scrolledtext
+from tkinter import Tk, Label, Entry, Button, filedialog, StringVar, Frame, END, W, E, S, N, scrolledtext, messagebox
 from pdfminer.high_level import extract_text
 from textstat import flesch_reading_ease
 from docx import Document
 import pandas as pd
 from textblob import TextBlob
+from collections import Counter
+
+# Try importing NLTK stopwords
+try:
+    import nltk
+    nltk.download('stopwords', quiet=True)
+    from nltk.corpus import stopwords
+except Exception as e:
+    print("Error importing NLTK stopwords:", e)
+    print("Please install NLTK and download the 'stopwords' corpus.")
+    sys.exit(1)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, filename='evaluation.log', filemode='w',
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-def extract_emails_from_text(text):
+def extract_comments_from_text(text):
     """
-    Extracts individual emails from a text string.
-    Assumes that emails are separated by headers starting with 'From: '.
-    Adjust the pattern as needed based on the actual format.
+    Extracts individual comments from a text string.
+    Adjusted to handle text where sections start with 'DOS'.
     """
-    # Regular expression pattern to identify email headers
-    email_pattern = r'(From: .+?)(?=From: |\Z)'
-    emails = re.findall(email_pattern, text, flags=re.DOTALL | re.MULTILINE)
-    logging.info(f"Extracted {len(emails)} emails from text.")
-    return emails
+    # Regular expression pattern to identify sections starting with 'DOS'
+    comment_pattern = r'(DOS.+?)(?=DOS|\Z)'
+    comments = re.findall(comment_pattern, text, flags=re.DOTALL | re.MULTILINE)
+    if not comments:
+        # If no 'DOS' headers are found, treat the whole text as one comment
+        comments = [text]
+    logging.info(f"Extracted {len(comments)} comments from text.")
+    return comments
 
 
-def extract_emails_from_pdf(pdf_path):
+def extract_comments_from_docx(docx_path):
     """
-    Extracts emails from a PDF file.
-    """
-    try:
-        text = extract_text(pdf_path)
-        emails = extract_emails_from_text(text)
-        return emails
-    except Exception as e:
-        logging.error(f"Error extracting text from {pdf_path}: {e}")
-        return []
-
-
-def extract_emails_from_docx(docx_path):
-    """
-    Extracts emails from a Word (.docx) file.
+    Extracts comments from a Word (.docx) file.
     """
     try:
         doc = Document(docx_path)
         text = '\n'.join([para.text for para in doc.paragraphs])
-        emails = extract_emails_from_text(text)
-        return emails
+        # Split text at each occurrence of 'DOS' to get individual responses
+        comments = extract_comments_from_text(text)
+        return comments
     except Exception as e:
         logging.error(f"Error extracting text from {docx_path}: {e}")
         return []
 
 
-def extract_emails_from_txt(txt_path):
+def extract_comments_from_pdf(pdf_path):
     """
-    Extracts emails from a text (.txt) file.
+    Extracts comments from a PDF file.
+    """
+    try:
+        text = extract_text(pdf_path)
+        comments = extract_comments_from_text(text)
+        return comments
+    except Exception as e:
+        logging.error(f"Error extracting text from {pdf_path}: {e}")
+        return []
+
+
+def extract_comments_from_txt(txt_path):
+    """
+    Extracts comments from a text (.txt) file.
     """
     try:
         with open(txt_path, 'r', encoding='utf-8') as f:
             text = f.read()
-        emails = extract_emails_from_text(text)
-        return emails
+        comments = extract_comments_from_text(text)
+        return comments
     except Exception as e:
         logging.error(f"Error reading {txt_path}: {e}")
         return []
 
 
-def extract_emails_from_csv(csv_path):
+def extract_comments_from_csv(csv_path):
     """
-    Extracts emails from a CSV file.
-    Assumes that the email content is in a column named 'email' or 'Email'.
+    Extracts comments from a CSV file.
+    Assumes that the comment content is in a column named 'comment' or 'Comment'.
     """
-    emails = []
+    comments = []
     try:
-        with open(csv_path, 'r', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                email_content = row.get('email') or row.get('Email')
-                if email_content:
-                    emails.append(email_content)
-        logging.info(f"Extracted {len(emails)} emails from {csv_path}")
-        return emails
+        df = pd.read_csv(csv_path, encoding='utf-8')
+        if 'comment' in df.columns:
+            comments = df['comment'].dropna().tolist()
+        elif 'Comment' in df.columns:
+            comments = df['Comment'].dropna().tolist()
+        else:
+            # If no 'comment' column, treat each row as a comment
+            comments = df.apply(lambda row: ' '.join(row.values.astype(str)), axis=1).tolist()
+        logging.info(f"Extracted {len(comments)} comments from {csv_path}")
+        return comments
     except Exception as e:
         logging.error(f"Error reading {csv_path}: {e}")
         return []
@@ -99,32 +116,47 @@ def evaluate_comment_locally(comment_text, criteria, comment_id, filename):
     max_score = len(criteria)
     score = 0
 
-    # Split comment into sentences
+    # Split comment into sentences using regex
     sentences = re.split(r'(?<=[.!?])\s+', comment_text.strip())
+    total_sentences = len(sentences)
 
     # Evaluate each criterion
     evaluation_data = {}
+    keyword_frequency = {}
+
     for criterion, details in criteria.items():
         details['score'] = 0  # Reset score
-        details['sentences'] = []  # Reset sentences
+        details['sentences'] = set()  # Use a set to store unique sentences
 
         if criterion == 'Writing Quality':
             # Use readability score and sentence length as proxies for writing quality
-            readability = flesch_reading_ease(comment_text)
+            try:
+                readability = flesch_reading_ease(comment_text)
+            except:
+                readability = 0  # If calculation fails, set to 0
             avg_sentence_length = sum(len(s.split()) for s in sentences) / max(len(sentences), 1)
             if readability >= 60 and avg_sentence_length <= 20:
                 details['score'] = 1
+            # Record whether the criterion was met
+            evaluation_data[criterion] = 'Yes' if details.get('score', 0) else 'No'
+            keyword_frequency[criterion] = f"Readability: {readability:.2f}, Avg Sentence Length: {avg_sentence_length:.2f}"
         else:
-            # Check for presence of keywords in sentences
             for sentence in sentences:
                 for keyword in details['keywords']:
                     if keyword.lower() in sentence.lower():
-                        details['score'] = 1
-                        details['sentences'].append(sentence.strip())
-                        break  # Avoid duplicate sentences for the same keyword
-
-        # Record whether the criterion was met
-        evaluation_data[criterion] = 'Yes' if details.get('score', 0) else 'No'
+                        details['sentences'].add(sentence.strip())
+            # Calculate the percentage of sentences containing keywords
+            keyword_count = len(details['sentences'])
+            if total_sentences > 0:
+                keyword_percentage = (keyword_count / total_sentences) * 100
+            else:
+                keyword_percentage = 0
+            keyword_frequency[criterion] = f"{keyword_percentage:.2f}%"
+            # Decide if the criterion is met based on a threshold, e.g., 10%
+            if keyword_percentage >= 10:
+                details['score'] = 1
+            # Record whether the criterion was met
+            evaluation_data[criterion] = 'Yes' if details.get('score', 0) else 'No'
 
     # Calculate total score
     score = sum(details.get('score', 0) for details in criteria.values())
@@ -145,16 +177,16 @@ def evaluate_comment_locally(comment_text, criteria, comment_id, filename):
         evaluation_data['Sentiment'] = 'Neutral'
 
     # Extract Keywords (Top 5 most frequent words excluding stopwords)
-    from collections import Counter
-    import nltk
-    nltk.download('stopwords', quiet=True)
-    from nltk.corpus import stopwords
     stop_words = set(stopwords.words('english'))
     words = re.findall(r'\b\w+\b', comment_text.lower())
     words = [word for word in words if word not in stop_words]
     word_counts = Counter(words)
     top_keywords = [word for word, count in word_counts.most_common(5)]
     evaluation_data['Keywords'] = ', '.join(top_keywords)
+
+    # Keyword Frequency Counter
+    keyword_freq_str = ', '.join(f"{k}: {v}" for k, v in keyword_frequency.items())
+    evaluation_data['Keyword Frequency'] = keyword_freq_str if keyword_freq_str else 'N/A'
 
     # Assign Themes (based on predefined keywords)
     themes = []
@@ -170,6 +202,15 @@ def evaluate_comment_locally(comment_text, criteria, comment_id, filename):
                 themes.append(theme)
                 break
     evaluation_data['Themes'] = ', '.join(set(themes)) if themes else 'N/A'
+
+    # Provision Matching
+    matching_provisions = []
+    for provision, keywords in provision_keywords.items():
+        for keyword in keywords:
+            if keyword.lower() in comment_text.lower():
+                matching_provisions.append(provision)
+                break
+    evaluation_data['Relevant Provision'] = ', '.join(set(matching_provisions)) if matching_provisions else 'N/A'
 
     # Stakeholder (Assuming we can detect based on content)
     if 'host family' in comment_text.lower():
@@ -205,11 +246,12 @@ def evaluate_comment_locally(comment_text, criteria, comment_id, filename):
     evaluation_data['Text'] = comment_text
     evaluation_data['Source'] = filename
 
-    # Add Email Excerpt for reference (first 200 characters)
-    evaluation_data['Email Excerpt'] = comment_text[:200]
+    # Extract Email Excerpt (First two sentences from the body)
+    email_excerpt = ' '.join(sentences[:2])
+    evaluation_data['Email Excerpt'] = email_excerpt
 
-    # Logging the email content for traceback
-    logging.info(f"Evaluated Comment ID {comment_id} from {filename}. Comment content: {comment_text[:200]}...")
+    # Logging the comment content for traceback
+    logging.info(f"Evaluated Comment ID {comment_id} from {filename}. Comment content: {email_excerpt}...")
 
     return evaluation_data
 
@@ -218,7 +260,7 @@ def process_files_in_directory(directory_path, criteria, output_text_widget):
     """
     Processes all files in the given directory and updates the output_text_widget with evaluations.
     Supports PDF, TXT, DOCX, and CSV files.
-    Also collects evaluation data to export to an Excel file.
+    Also collects evaluation data to export to an Excel and CSV file.
     """
     evaluation_results = []
     comment_id = 1
@@ -226,37 +268,38 @@ def process_files_in_directory(directory_path, criteria, output_text_widget):
         for filename in os.listdir(directory_path):
             filepath = os.path.join(directory_path, filename)
             if os.path.isfile(filepath):
-                emails = []
+                comments = []
                 if filename.lower().endswith('.pdf'):
                     logging.info(f"Processing PDF file: {filename}")
                     output_text_widget.insert(END, f"Processing file: {filename}\n\n")
-                    emails = extract_emails_from_pdf(filepath)
+                    comments = extract_comments_from_pdf(filepath)
                 elif filename.lower().endswith('.docx'):
                     logging.info(f"Processing Word file: {filename}")
                     output_text_widget.insert(END, f"Processing file: {filename}\n\n")
-                    emails = extract_emails_from_docx(filepath)
+                    comments = extract_comments_from_docx(filepath)
                 elif filename.lower().endswith('.txt'):
                     logging.info(f"Processing TXT file: {filename}")
                     output_text_widget.insert(END, f"Processing file: {filename}\n\n")
-                    emails = extract_emails_from_txt(filepath)
+                    comments = extract_comments_from_txt(filepath)
                 elif filename.lower().endswith('.csv'):
                     logging.info(f"Processing CSV file: {filename}")
                     output_text_widget.insert(END, f"Processing file: {filename}\n\n")
-                    emails = extract_emails_from_csv(filepath)
+                    comments = extract_comments_from_csv(filepath)
                 else:
                     logging.info(f"Unsupported file type: {filename}")
                     continue  # Skip unsupported file types
 
-                logging.info(f"Extracted {len(emails)} emails from {filename}")
+                logging.info(f"Extracted {len(comments)} comments from {filename}")
 
-                for idx, email_content in enumerate(emails):
-                    output_text_widget.insert(END, f"Evaluating email {idx+1}/{len(emails)} in {filename}\n")
+                for idx, comment_text in enumerate(comments):
+                    output_text_widget.insert(END, f"Evaluating comment {idx+1}/{len(comments)} in {filename}\n")
                     try:
-                        evaluation_data = evaluate_comment_locally(email_content, criteria, comment_id, filename)
+                        evaluation_data = evaluate_comment_locally(comment_text, criteria, comment_id, filename)
                         if evaluation_data:
                             # Display in GUI
                             output_text_widget.insert(END, f"Comment ID: {comment_id}\n")
-                            output_text_widget.insert(END, f"Email Excerpt: {email_content[:200]}...\n")
+                            output_text_widget.insert(END, f"Excerpt: {evaluation_data['Email Excerpt']}...\n")
+                            output_text_widget.insert(END, f"Relevant Provision: {evaluation_data['Relevant Provision']}\n")
                             output_text_widget.insert(END, f"Score: {evaluation_data['Quality Score']}\n")
                             output_text_widget.insert(END, f"Sentiment: {evaluation_data['Sentiment']}\n")
                             output_text_widget.insert(END, '-' * 80 + '\n')
@@ -264,18 +307,18 @@ def process_files_in_directory(directory_path, criteria, output_text_widget):
                             evaluation_results.append(evaluation_data)
                             comment_id += 1
                     except Exception as e:
-                        logging.error(f"Error evaluating email {idx+1} in {filename}: {e}")
-                        output_text_widget.insert(END, f"Error evaluating email {idx+1} in {filename}: {e}\n")
-                        output_text_widget.insert(END, f"Email content: {email_content[:200]}...\n")
+                        logging.error(f"Error evaluating comment {idx+1} in {filename}: {e}")
+                        output_text_widget.insert(END, f"Error evaluating comment {idx+1} in {filename}: {e}\n")
+                        output_text_widget.insert(END, f"Comment content: {comment_text[:200]}...\n")
                         output_text_widget.insert(END, '-' * 80 + '\n')
                     output_text_widget.update()
         # Check if evaluation_results has data
         if evaluation_results:
-            # After processing all files, export results to Excel
-            export_excel(evaluation_results)
+            # After processing all files, export results to Excel and CSV
+            export_results(evaluation_results)
             logging.info("Evaluation completed successfully.")
             output_text_widget.insert(END, "Evaluation completed successfully.\n")
-            output_text_widget.insert(END, f"Results have been saved to 'evaluation_results.xlsx'.\n")
+            output_text_widget.insert(END, f"Results have been saved to 'evaluation_results.xlsx' and 'evaluation_results.csv'.\n")
         else:
             logging.warning("No evaluation results to export.")
             output_text_widget.insert(END, "No evaluation results to export.\n")
@@ -284,9 +327,9 @@ def process_files_in_directory(directory_path, criteria, output_text_widget):
         output_text_widget.insert(END, f"Error processing files: {e}\n")
 
 
-def export_excel(evaluation_results):
+def export_results(evaluation_results):
     """
-    Exports the evaluation results to an Excel file.
+    Exports the evaluation results to an Excel and CSV file.
     """
     if not evaluation_results:
         logging.warning("No evaluation results to export.")
@@ -294,8 +337,8 @@ def export_excel(evaluation_results):
     df = pd.DataFrame(evaluation_results)
     # Rearranging columns to match the desired output
     columns_order = [
-        'Comment ID', 'Email Excerpt', 'Text', 'Themes', 'Sentiment', 'Quality Score', 'Stakeholder',
-        'Market', 'Priority', 'Keywords', 'Recommendations', 'Source'
+        'Comment ID', 'Email Excerpt', 'Text', 'Themes', 'Sentiment', 'Quality Score', 'Keyword Frequency',
+        'Stakeholder', 'Market', 'Priority', 'Keywords', 'Recommendations', 'Relevant Provision', 'Source'
     ]
     # Verify all columns are present
     missing_columns = set(columns_order) - set(df.columns)
@@ -305,11 +348,15 @@ def export_excel(evaluation_results):
         return
     df = df[columns_order]
     try:
+        # Export to Excel
         df.to_excel('evaluation_results.xlsx', index=False)
         logging.info("Evaluation results have been exported to 'evaluation_results.xlsx'.")
+        # Export to CSV
+        df.to_csv('evaluation_results.csv', index=False)
+        logging.info("Evaluation results have been exported to 'evaluation_results.csv'.")
     except Exception as e:
-        logging.error(f"Error exporting results to Excel: {e}")
-        print(f"Error exporting results to Excel: {e}")
+        logging.error(f"Error exporting results: {e}")
+        print(f"Error exporting results: {e}")
 
 
 def start_evaluation_thread(directory_path, criteria, output_text_widget):
@@ -335,7 +382,7 @@ def create_gui():
         },
         'Constructive Criticism': {
             'description': 'Detailed critiques or feedback that provide actionable insights or suggestions for improvement.',
-            'keywords': ['suggest', 'recommend', 'advise', 'propose', 'should', 'could', 'improve', 'enhance'],
+            'keywords': ['I suggest', 'recommend', 'advise', 'propose', 'should', 'could', 'improve', 'enhance'],
         },
         'Writing Quality': {
             'description': 'Comments written in a clear, concise, and well-organized manner.',
@@ -347,40 +394,26 @@ def create_gui():
         'Provisions Mentioned': {
             'description': 'Comments that mention specific provisions from 22 CFR Part 62.',
             'keywords': [
-                # Add the provision keywords here
-                '62.31(a)', 'Au Pairs', 'Purpose', 'Part-time program', 'Full-time program',
-                '62.31(b)', 'Program Designation',
-                '62.31(c)', 'Program Conditions', 'Standard Operating Procedures', 'Foreign Third Parties', 'Vetting',
-                'Rematch', 'Emergency Procedures', 'Local Coordinator',
-                '62.31(d)', 'Au Pair Eligibility', 'Suitability', 'Interview', 'Driver\'s License', 'Physical Exam', 'Vaccinations',
-                '62.31(e)', 'Au Pair Placement', 'Host Family Agreement', 'Personal Space',
-                '62.31(f)', 'Au Pair Orientation', 'Pre-Departure Materials', 'Post-Arrival Orientation',
-                'Travel Arrangements', 'Compensation', 'Benefits', 'Deductions', 'Work Hours', 'Child Care Duties', 'Taxes',
-                '62.31(g)', 'Au Pair Training', 'Child Safety', 'Child Development', 'Driving',
-                '62.31(h)', 'Host Family Selection', 'English Proficiency', 'Residency', 'Criminal Background Checks',
-                '62.31(i)', 'Host Family Orientation', 'Host Family Agreement', 'IRS Taxation', 'Child Care Hours',
-                '62.31(j)', 'Host Family Agreement', 'Fees', 'Duties', 'Weekly Schedule', 'Weekends', 'Paid Time Off',
-                'Compensation', 'Room and Board', 'In-kind Benefits', 'Training', 'Home Environment', 'Changes', 'Rematch',
-                '62.31(k)', 'Au Pair Limitations', 'Protections', 'Rest', 'Paid Time Off', 'Sick Leave', 'Privacy',
-                'Identification Papers', 'Sexual Harassment', 'Exploitation', 'Abuse', 'Nanny Cam', 'Photography',
-                '62.31(l)', 'Rematch', 'Standard Operating Procedures', 'Refund', 'Program Duration',
-                '62.31(m)', 'Hours', 'Host Family Agreement', 'Overtime', 'Exigent Circumstances', 'Child Care', 'Timesheets',
-                '62.31(n)', 'Compensation', 'Weekly Payments', 'Tiers', 'Minimum Wage', 'Overtime', 'Deductions',
-                'Room and Board', 'In-kind Benefits',
-                '62.31(o)', 'Educational Component', 'Academic Option', 'Online Classes', 'Continuing Education',
-                'Customized Courses', 'Community Service', 'Educational Stipend',
-                '62.31(p)', 'Monitoring', 'Records', 'Local Coordinators', 'Personal Contact', 'Host Family Visits',
-                'Communication',
-                '62.31(q)', 'Duration', 'Extensions',
-                '62.31(r)', 'Reporting Requirements', 'SEVIS', 'Surveys', 'Complaints', 'Removals', 'Rematches',
-                'Promotional Materials', 'Fees', 'Foreign Third Parties',
-                '62.31(s)', 'Repeat Participation',
-                '62.31(t)', 'Relationship to State and Local Laws', 'Preemption', 'Federalism', 'Minimum Wage', 'Overtime',
-                'Unemployment Insurance', 'Employment Training Taxes',
-                '62.31(u)', 'Severability',
-                '62.31(v)', 'Transition Period', 'Grandfathering', 'Implementation',
+                '62.31(a)', '62.31(b)', '62.31(c)', '62.31(d)', '62.31(e)', '62.31(f)', '62.31(g)',
+                '62.31(h)', '62.31(i)', '62.31(j)', '62.31(k)', '62.31(l)', '62.31(m)', '62.31(n)',
+                '62.31(o)', '62.31(p)', '62.31(q)', '62.31(r)', '62.31(s)', '62.31(t)', '62.31(u)', '62.31(v)'
+                # Add any additional specific provision numbers or unique phrases
             ],
         },
+    }
+
+    # Provision Keywords for Matching
+    global provision_keywords
+    provision_keywords = {
+        '62.31(a)': ['au pair', 'purpose', 'part-time program', 'full-time program'],
+        '62.31(b)': ['program designation'],
+        '62.31(c)': ['program conditions', 'standard operating procedures', 'foreign third parties', 'vetting',
+                     'rematch', 'emergency procedures', 'local coordinator'],
+        '62.31(d)': ['au pair eligibility', 'suitability', 'interview', 'driver\'s license', 'physical exam', 'vaccinations'],
+        '62.31(e)': ['au pair placement', 'host family agreement', 'personal space'],
+        '62.31(f)': ['au pair orientation', 'pre-departure materials', 'post-arrival orientation',
+                     'travel arrangements', 'compensation', 'benefits', 'deductions', 'work hours', 'child care duties', 'taxes'],
+        # Add the rest of the provisions here...
     }
 
     # Function to select directory
@@ -468,8 +501,9 @@ if __name__ == '__main__':
     except ImportError:
         print("Installing required packages...")
         import subprocess
-        subprocess.check_call(['pip', 'install', 'pdfminer.six', 'textstat', 'python-docx', 'pandas', 'nltk', 'textblob'])
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install',
+                               'pdfminer.six', 'textstat', 'python-docx', 'pandas', 'nltk', 'textblob'])
         print("Packages installed. Please run the script again.")
-        exit()
+        sys.exit(1)
 
     create_gui()
